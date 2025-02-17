@@ -241,8 +241,8 @@ func NewServer(config *Config) *Server {
 
 func (s *Server) Start() error {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", s.handleOpenAIRequests)
-	mux.HandleFunc("/v1/models", s.handleOpenAIRequests) // 使用同一个 handler 处理 /v1/models
+	mux.HandleFunc("/hf/v1/chat/completions", s.handleOpenAIRequests)
+	mux.HandleFunc("/hf/v1/models", s.handleOpenAIRequests) // 使用同一个 handler 处理 /hf/v1/models
 	mux.HandleFunc("/health", s.handleHealth)
 
 	s.srv = &http.Server{
@@ -267,18 +267,23 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleOpenAIRequests(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost && r.URL.Path == "/v1/chat/completions" { // /v1/models 可以是 GET
+	if r.Method != http.MethodPost && r.URL.Path == "/hf/v1/chat/completions" { // /hf/v1/models 可以是 GET
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if r.Method != http.MethodGet && r.URL.Path == "/v1/models" {
+	if r.Method != http.MethodGet && r.URL.Path == "/hf/v1/models" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	logger := NewRequestLogger(s.config)
 
-	fullAPIKey := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	// 优先使用X-Original-Authorization，如果没有则使用Authorization
+	fullAPIKey := strings.TrimPrefix(r.Header.Get("X-Original-Authorization"), "Bearer ")
+	if fullAPIKey == "" {
+		fullAPIKey = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	}
+	
 	apiKey := extractRealAPIKey(fullAPIKey)
 	channelID := extractChannelID(fullAPIKey)
 
@@ -292,17 +297,17 @@ func (s *Server) handleOpenAIRequests(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.URL.Path == "/v1/models" {
-		// 处理 /v1/models 请求
+	if r.URL.Path == "/hf/v1/models" {
+		// 处理 /hf/v1/models 请求
 		req := &ChatCompletionRequest{ //  虽然是 ChatCompletionRequest 结构体，但这里只用它来传递 APIKey 等信息
 			APIKey: apiKey,
 		}
-		logger.Log("Forwarding /v1/models request to channel: %s", targetChannel.Name)
+		logger.Log("Forwarding /hf/v1/models request to channel: %s", targetChannel.Name)
 		s.forwardModelsRequest(w, r.Context(), req, targetChannel)
 		return
 	}
 
-	// 读取请求体 (for /v1/chat/completions)
+	// 读取请求体 (for /hf/v1/chat/completions)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		logger.Log("Error reading request body: %v", err)
@@ -540,7 +545,10 @@ func (s *Server) forwardRequest(w http.ResponseWriter, ctx context.Context, req 
 
 	log.Printf("Forwarding request details:")
 	log.Printf("- Channel: %s", targetChannel.Name)
-	log.Printf("- URL: %s", targetChannel.GetFullURL())
+	
+	// 构建目标URL，将/hf/1替换为/v1
+	targetURL := strings.Replace(targetChannel.GetFullURL(), "/hf/v1", "/v1", 1)
+	log.Printf("- URL: %s", targetURL)
 	log.Printf("- Model: %s", req.Model)
 	log.Printf("- Input API Key: %s", logAPIKey(req.APIKey))
 
@@ -564,7 +572,7 @@ func (s *Server) forwardRequest(w http.ResponseWriter, ctx context.Context, req 
 	}
 
 	request, err := http.NewRequestWithContext(ctx, "POST",
-		targetChannel.GetFullURL(),
+		targetURL,
 		bytes.NewBuffer(jsonData))
 	if err != nil {
 		log.Printf("Error creating request: %v", err)
@@ -617,7 +625,7 @@ func (s *Server) forwardRequest(w http.ResponseWriter, ctx context.Context, req 
 func (s *Server) forwardModelsRequest(w http.ResponseWriter, ctx context.Context, req *ChatCompletionRequest, targetChannel Channel) {
 	logger := NewRequestLogger(s.config)
 
-	log.Printf("Forwarding /v1/models request details:")
+	log.Printf("Forwarding /hf/v1/models request details:")
 	log.Printf("- Channel: %s", targetChannel.Name)
 
 	// 1. 构建完整的 chat completions URL
@@ -632,9 +640,9 @@ func (s *Server) forwardModelsRequest(w http.ResponseWriter, ctx context.Context
 		return
 	}
 
-	// 3. 构建 models URL：使用解析后的 URL 的 Base 部分，然后拼接 "/v1/models"
+	// 3. 构建 models URL：使用解析后的 URL 的 Base 部分，然后拼接 "/v1/models" (注意：转换回标准OpenAI路径)
 	baseURL := parsedChatURL.Scheme + "://" + parsedChatURL.Host
-	modelsURL := strings.TrimSuffix(baseURL, "/") + "/v1/models" // 确保 baseURL 末尾没有斜杠再拼接
+	modelsURL := strings.TrimSuffix(baseURL, "/") + "/v1/models" // 转换回标准OpenAI路径
 	log.Printf("- Models URL: %s", modelsURL)
 	log.Printf("- Input API Key: %s", logAPIKey(req.APIKey))
 
@@ -650,18 +658,18 @@ func (s *Server) forwardModelsRequest(w http.ResponseWriter, ctx context.Context
 		modelsURL,
 		nil)
 	if err != nil {
-		log.Printf("Error creating /v1/models request: %v", err)
+		log.Printf("Error creating /hf/v1/models request: %v", err)
 		http.Error(w, "Failed to create request", http.StatusInternalServerError)
 		return
 	}
 
 	request.Header.Set("Authorization", "Bearer "+req.APIKey)
 
-	log.Printf("Request headers for /v1/models: %v", maskSensitiveHeaders(request.Header))
+	log.Printf("Request headers for /hf/v1/models: %v", maskSensitiveHeaders(request.Header))
 
 	resp, err := client.Do(request)
 	if err != nil {
-		log.Printf("Error forwarding /v1/models request: %v", err)
+		log.Printf("Error forwarding /hf/v1/models request: %v", err)
 		http.Error(w, fmt.Sprintf("Failed to forward request: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -670,18 +678,18 @@ func (s *Server) forwardModelsRequest(w http.ResponseWriter, ctx context.Context
 	// 读取响应体
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		log.Printf("Error reading /v1/models response body: %v", err)
+		log.Printf("Error reading /hf/v1/models response body: %v", err)
 		http.Error(w, "Failed to read response", http.StatusInternalServerError)
 		return
 	}
 
 	// 打印响应内容 (可选)
 	if s.config.Global.Log.Debug.PrintResponse {
-		logger.LogContent("/v1/models Response", string(respBody), s.config.Global.Log.Debug.MaxContentLength)
+		logger.LogContent("/hf/v1/models Response", string(respBody), s.config.Global.Log.Debug.MaxContentLength)
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		log.Printf("Error response from target for /v1/models: Status: %d, Body: %s", resp.StatusCode, string(respBody))
+		log.Printf("Error response from target for /hf/v1/models: Status: %d, Body: %s", resp.StatusCode, string(respBody))
 		http.Error(w, fmt.Sprintf("Target server error: %s", resp.Status), resp.StatusCode)
 		return
 	}
